@@ -1,0 +1,334 @@
+From 155c30bba4ae50a81638c94f463e3a9d89b8e069 Mon Sep 17 00:00:00 2001
+From: Patrick O'Neill <patrick@rivosinc.com>
+Date: Wed, 26 Jun 2024 17:25:52 -0700
+Subject: [PATCH 3/7] RISC-V: Add support for setting vector SEW
+
+Signed-Off-By: Patrick O'Neill <patrick@rivosinc.com>
+---
+ .../passes/initialization/__init__.py         |  8 +-
+ src/microprobe/target/isa/operand.py          | 10 ++-
+ .../riscv/isa/riscv-common/instruction.yaml   | 84 ++++++++++++++++---
+ .../isa/riscv-common/instruction_format.yaml  | 74 ++++++++++++++--
+ targets/riscv/isa/riscv-common/isa.py         | 22 +++--
+ targets/riscv/policies/seq.py                 |  8 +-
+ 6 files changed, 170 insertions(+), 36 deletions(-)
+
+diff --git a/src/microprobe/passes/initialization/__init__.py b/src/microprobe/passes/initialization/__init__.py
+index 5ef069c..0469c0f 100644
+--- a/src/microprobe/passes/initialization/__init__.py
++++ b/src/microprobe/passes/initialization/__init__.py
+@@ -222,6 +222,7 @@ class InitializeRegistersPass(microprobe.passes.Pass):
+         warn_unknown = kwargs.get("warn_unknown", False)
+         self._force_code = kwargs.get("force_code", False)
+         self.lmul = kwargs.get("lmul", 1)
++        self.sew = kwargs.get("sew", 32)
+ 
+         if len(args) == 1:
+             self._reg_dict = dict(
+@@ -300,10 +301,11 @@ class InitializeRegistersPass(microprobe.passes.Pass):
+                 force_direct = True
+ 
+             if reg.name == "LMUL":
++                packed_lmul_sew = self.lmul << 9 | self.sew & 127
+                 building_block.add_init(
+-                    target.isa.set_register(reg, self.lmul,
+-                                            building_block.context))
+-                building_block.context.set_register_value(reg, self.lmul)
++                    target.isa.set_register(reg, packed_lmul_sew, building_block.context)
++                )
++                building_block.context.set_register_value(reg, packed_lmul_sew)
+                 continue
+ 
+             all_vec_regs = set([f"V{i}" for i in range(0, 32)])
+diff --git a/src/microprobe/target/isa/operand.py b/src/microprobe/target/isa/operand.py
+index e34d72a..cf80d43 100644
+--- a/src/microprobe/target/isa/operand.py
++++ b/src/microprobe/target/isa/operand.py
+@@ -826,11 +826,15 @@ class OperandReg(Operand):
+         return list(self._regs.keys())
+ 
+     def filtered_values(self, context: Context, fieldname: str):
+-        lmul = cast(int | None, context.get_registername_value("LMUL"))
++        lmul_sew = cast(int | None, context.get_registername_value("LMUL"))
+ 
+-        if lmul is None or not fieldname.startswith("v"):
++        if lmul_sew is None or not fieldname.startswith("v"):
+             return self.values()
+-        elif fieldname in ["vd", "vmd", "vrs1", "vrs2", "vmask"]:
++
++        sew = lmul_sew & 127
++        lmul = lmul_sew >> 9
++
++        if fieldname in ["vd", "vmd", "vrs1", "vrs2", "vmask"]:
+             lmul *= 1
+         elif fieldname in ["vdd", "vdmd", "vdrs1", "vdrs2", "vnd", "vnmd"]:
+             lmul *= 2
+diff --git a/targets/riscv/isa/riscv-common/instruction.yaml b/targets/riscv/isa/riscv-common/instruction.yaml
+index cd9dbe7..489eeb3 100644
+--- a/targets/riscv/isa/riscv-common/instruction.yaml
++++ b/targets/riscv/isa/riscv-common/instruction.yaml
+@@ -2083,24 +2083,84 @@
+     funct3: ['1', 'funct3', '?']
+ # Manually added
+ - Description: Set lmul
+-  Format: vsetivli_lmul1
+-  Mnemonic: vsetivli
+-  Name: vsetivli_lmul1
++  Format: vsetivli_lmul1_e8
++  Mnemonic: VSETIVLI
++  Name: vsetivli_lmul1_e8
+   Opcode: '0'
+ - Description: Set lmul
+-  Format: vsetivli_lmul2
+-  Mnemonic: vsetivli
+-  Name: vsetivli_lmul2
++  Format: vsetivli_lmul2_e8
++  Mnemonic: VSETIVLI
++  Name: vsetivli_lmul2_e8
+   Opcode: '0'
+ - Description: Set lmul
+-  Format: vsetivli_lmul4
+-  Mnemonic: vsetivli
+-  Name: vsetivli_lmul4
++  Format: vsetivli_lmul4_e8
++  Mnemonic: VSETIVLI
++  Name: vsetivli_lmul4_e8
+   Opcode: '0'
+ - Description: Set lmul
+-  Format: vsetivli_lmul8
+-  Mnemonic: vsetivli
+-  Name: vsetivli_lmul8
++  Format: vsetivli_lmul8_e8
++  Mnemonic: VSETIVLI
++  Name: vsetivli_lmul8_e8
++  Opcode: '0'
++- Description: Set lmul
++  Format: vsetivli_lmul1_e16
++  Mnemonic: VSETIVLI
++  Name: vsetivli_lmul1_e16
++  Opcode: '0'
++- Description: Set lmul
++  Format: vsetivli_lmul2_e16
++  Mnemonic: VSETIVLI
++  Name: vsetivli_lmul2_e16
++  Opcode: '0'
++- Description: Set lmul
++  Format: vsetivli_lmul4_e16
++  Mnemonic: VSETIVLI
++  Name: vsetivli_lmul4_e16
++  Opcode: '0'
++- Description: Set lmul
++  Format: vsetivli_lmul8_e16
++  Mnemonic: VSETIVLI
++  Name: vsetivli_lmul8_e16
++  Opcode: '0'
++- Description: Set lmul
++  Format: vsetivli_lmul1_e32
++  Mnemonic: VSETIVLI
++  Name: vsetivli_lmul1_e32
++  Opcode: '0'
++- Description: Set lmul
++  Format: vsetivli_lmul2_e32
++  Mnemonic: VSETIVLI
++  Name: vsetivli_lmul2_e32
++  Opcode: '0'
++- Description: Set lmul
++  Format: vsetivli_lmul4_e32
++  Mnemonic: VSETIVLI
++  Name: vsetivli_lmul4_e32
++  Opcode: '0'
++- Description: Set lmul
++  Format: vsetivli_lmul8_e32
++  Mnemonic: VSETIVLI
++  Name: vsetivli_lmul8_e32
++  Opcode: '0'
++- Description: Set lmul
++  Format: vsetivli_lmul1_e64
++  Mnemonic: VSETIVLI
++  Name: vsetivli_lmul1_e64
++  Opcode: '0'
++- Description: Set lmul
++  Format: vsetivli_lmul2_e64
++  Mnemonic: VSETIVLI
++  Name: vsetivli_lmul2_e64
++  Opcode: '0'
++- Description: Set lmul
++  Format: vsetivli_lmul4_e64
++  Mnemonic: VSETIVLI
++  Name: vsetivli_lmul4_e64
++  Opcode: '0'
++- Description: Set lmul
++  Format: vsetivli_lmul8_e64
++  Mnemonic: VSETIVLI
++  Name: vsetivli_lmul8_e64
+   Opcode: '0'
+ # Generated using parse_binutils_riscv.py
+ - Description: Auto parsed from binutils. Opcode is dummy data
+diff --git a/targets/riscv/isa/riscv-common/instruction_format.yaml b/targets/riscv/isa/riscv-common/instruction_format.yaml
+index 3f8ea93..bf49eed 100644
+--- a/targets/riscv/isa/riscv-common/instruction_format.yaml
++++ b/targets/riscv/isa/riscv-common/instruction_format.yaml
+@@ -611,22 +611,82 @@
+   Fields:
+   - funct25
+   - opcode
+-  Name: vsetivli_lmul1
+-- Assembly: OPC zero,16,m2,ta,ma
++  Name: vsetivli_lmul1_e8
++- Assembly: OPC zero,16,e8,m2,ta,ma
+   Fields:
+   - funct25
+   - opcode
+-  Name: vsetivli_lmul2
+-- Assembly: OPC zero,16,m4,ta,ma
++  Name: vsetivli_lmul2_e8
++- Assembly: OPC zero,16,e8,m4,ta,ma
+   Fields:
+   - funct25
+   - opcode
+-  Name: vsetivli_lmul4
+-- Assembly: OPC zero,16,m8,ta,ma
++  Name: vsetivli_lmul4_e8
++- Assembly: OPC zero,16,e8,m8,ta,ma
+   Fields:
+   - funct25
+   - opcode
+-  Name: vsetivli_lmul8
++  Name: vsetivli_lmul8_e8
++- Assembly: OPC zero,16,e16,m1,ta,ma
++  Fields:
++  - funct25
++  - opcode
++  Name: vsetivli_lmul1_e16
++- Assembly: OPC zero,16,e16,m2,ta,ma
++  Fields:
++  - funct25
++  - opcode
++  Name: vsetivli_lmul2_e16
++- Assembly: OPC zero,16,e16,m4,ta,ma
++  Fields:
++  - funct25
++  - opcode
++  Name: vsetivli_lmul4_e16
++- Assembly: OPC zero,16,e16,m8,ta,ma
++  Fields:
++  - funct25
++  - opcode
++  Name: vsetivli_lmul8_e16
++- Assembly: OPC zero,16,e32,m1,ta,ma
++  Fields:
++  - funct25
++  - opcode
++  Name: vsetivli_lmul1_e32
++- Assembly: OPC zero,16,e32,m2,ta,ma
++  Fields:
++  - funct25
++  - opcode
++  Name: vsetivli_lmul2_e32
++- Assembly: OPC zero,16,e32,m4,ta,ma
++  Fields:
++  - funct25
++  - opcode
++  Name: vsetivli_lmul4_e32
++- Assembly: OPC zero,16,e32,m8,ta,ma
++  Fields:
++  - funct25
++  - opcode
++  Name: vsetivli_lmul8_e32
++- Assembly: OPC zero,16,e64,m1,ta,ma
++  Fields:
++  - funct25
++  - opcode
++  Name: vsetivli_lmul1_e64
++- Assembly: OPC zero,16,e64,m2,ta,ma
++  Fields:
++  - funct25
++  - opcode
++  Name: vsetivli_lmul2_e64
++- Assembly: OPC zero,16,e64,m4,ta,ma
++  Fields:
++  - funct25
++  - opcode
++  Name: vsetivli_lmul4_e64
++- Assembly: OPC zero,16,e64,m8,ta,ma
++  Fields:
++  - funct25
++  - opcode
++  Name: vsetivli_lmul8_e64
+ # Generated using parse_binutils_riscv.py
+ - Assembly: OPC vd, i_imm5
+   Fields:
+diff --git a/targets/riscv/isa/riscv-common/isa.py b/targets/riscv/isa/riscv-common/isa.py
+index 2bf31f5..4ff9908 100644
+--- a/targets/riscv/isa/riscv-common/isa.py
++++ b/targets/riscv/isa/riscv-common/isa.py
+@@ -265,16 +265,22 @@ class RISCVISA(GenericISA):
+                     )
+                     instrs.append(shiftleft)
+ 
+-            LOG.debug("Register: %s set to value %d", register.name, value)
+-        elif register.type.name == "LMUL" and value in [1, 2, 4, 8]:
+-            vset = self.new_instruction(f"vsetivli_lmul{value}")
++            LOG.debug(f"Register: {register.name} set to value {value}")
++        elif register.type.name == "LMUL" and value in [lmul << 9 | sew & 127 for lmul in [1, 2, 4, 8] for sew in [8, 16, 32, 64]]:
++            sew = value & 127
++            lmul = value >> 9
++            vset = self.new_instruction(f"vsetivli_lmul{lmul}_e{sew}")
+             instrs.append(vset)
+-            LOG.debug("Register: %s set to value %d", register.name, value)
++            LOG.debug(f"Register: {register.name} set to value {value}")
+         else:
+-            raise NotImplementedError(
+-                "Microprobe doesn't know how to initialize "
+-                f"{register.type.name} register with value {value}."
+-            )
++            if register.type.name == "LMUL":
++                raise NotImplementedError(
++                    f"Don't know how to initialize {register.type.name} register with value {value}. LMUL: {value >> 9} SEW: {value & 127}"
++                )
++            else:
++                raise NotImplementedError(
++                    f"Don't know how to initialize {register.type.name} register with value {value}."
++                )
+ 
+         if len(instrs) > 0:
+             return instrs
+diff --git a/targets/riscv/policies/seq.py b/targets/riscv/policies/seq.py
+index 849cb48..67dd207 100644
+--- a/targets/riscv/policies/seq.py
++++ b/targets/riscv/policies/seq.py
+@@ -74,6 +74,8 @@ def policy(target, wrapper, **kwargs):
+             " %s" % (NAME, target.name, ",".join(SUPPORTED_TARGETS))
+         )
+ 
++    lmul = kwargs["lmul"]
++    sew = kwargs["sew"]
+     sequence = kwargs['instructions']
+ 
+     context = microprobe.code.context.Context()
+@@ -110,19 +112,19 @@ def policy(target, wrapper, **kwargs):
+     if vector and floating:
+         synthesizer.add_pass(
+             microprobe.passes.initialization.InitializeRegistersPass(
+-                v_value=(1.000000000000001, 64)
++                v_value=(1.000000000000001, 64), lmul=lmul, sew=sew
+             )
+         )
+     elif vector:
+         synthesizer.add_pass(
+             microprobe.passes.initialization.InitializeRegistersPass(
+-                v_value=(RNDINT(), 64)
++                v_value=(RNDINT(), 64), lmul=lmul, sew=sew
+             )
+         )
+     elif floating:
+         synthesizer.add_pass(
+             microprobe.passes.initialization.InitializeRegistersPass(
+-                fp_value=1.000000000000001
++                fp_value=1.000000000000001, lmul=lmul, sew=sew
+             )
+         )
+ 
+-- 
+2.34.1
+

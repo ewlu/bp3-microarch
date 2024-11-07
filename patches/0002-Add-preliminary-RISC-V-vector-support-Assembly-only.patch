@@ -1,0 +1,3302 @@
+From 5eb812be4f874055f3a302988428b4596de6b528 Mon Sep 17 00:00:00 2001
+From: Patrick O'Neill <patrick@rivosinc.com>
+Date: Mon, 24 Jul 2023 09:52:02 -0700
+Subject: [PATCH 2/7] Add preliminary RISC-V vector support (Assembly only)
+
+Signed-off-by: Patrick O'Neill <patrick@rivosinc.com>
+---
+ src/microprobe/code/ins.py                    |    8 +-
+ .../passes/initialization/__init__.py         |   47 +-
+ src/microprobe/target/isa/instruction.py      |    7 +
+ src/microprobe/target/isa/operand.py          |  104 +-
+ .../riscv/isa/riscv-common/instruction.yaml   | 2073 ++++++++++++++++-
+ .../isa/riscv-common/instruction_field.yaml   |   85 +
+ .../isa/riscv-common/instruction_format.yaml  |  411 +++-
+ targets/riscv/isa/riscv-common/isa.py         |   44 +-
+ targets/riscv/isa/riscv-common/operand.yaml   |   77 +
+ targets/riscv/isa/riscv-common/register.yaml  |   12 +
+ .../riscv/isa/riscv-common/register_type.yaml |    6 +
+ targets/riscv/policies/seq.py                 |    2 +-
+ 12 files changed, 2839 insertions(+), 37 deletions(-)
+
+diff --git a/src/microprobe/code/ins.py b/src/microprobe/code/ins.py
+index e5beb52..1d79823 100644
+--- a/src/microprobe/code/ins.py
++++ b/src/microprobe/code/ins.py
+@@ -21,7 +21,7 @@ from __future__ import absolute_import, division, print_function, annotations
+ # Built-in modules
+ import copy
+ from itertools import product
+-from typing import TYPE_CHECKING, Callable, List
++from typing import TYPE_CHECKING, Callable, Dict, List
+ 
+ # Third party modules
+ 
+@@ -1603,7 +1603,8 @@ class Instruction(Pickable):
+         self._generic_type = None
+         self._label = None
+         self._mem_operands = []
+-        self._operands = RejectingOrderedDict()
++        self._operands: Dict[str,
++                             InstructionOperandValue] = RejectingOrderedDict()
+ 
+     def set_arch_type(self, instrtype):
+         """
+@@ -1612,7 +1613,8 @@ class Instruction(Pickable):
+ 
+         """
+         self._arch_type = instrtype
+-        self._operands = RejectingOrderedDict()
++        self._operands: Dict[str,
++                             InstructionOperandValue] = RejectingOrderedDict()
+         self._mem_operands = []
+         self._allowed_regs = []
+         self._address = None
+diff --git a/src/microprobe/passes/initialization/__init__.py b/src/microprobe/passes/initialization/__init__.py
+index 2de72cb..5ef069c 100644
+--- a/src/microprobe/passes/initialization/__init__.py
++++ b/src/microprobe/passes/initialization/__init__.py
+@@ -16,7 +16,10 @@
+ """
+ 
+ # Futures
+-from __future__ import absolute_import, print_function
++from __future__ import absolute_import, print_function, annotations
++
++# Built-in modules
++from typing import TYPE_CHECKING
+ 
+ # Third party modules
+ 
+@@ -33,6 +36,11 @@ from microprobe.utils.cmdline import print_warning
+ from microprobe.utils.ieee import ieee_float_to_int64
+ from microprobe.utils.logger import get_logger
+ 
++# Type hinting
++if TYPE_CHECKING:
++    from microprobe.code.benchmark import Benchmark
++    from microprobe.target import Target
++
+ # Constants
+ LOG = get_logger(__name__)
+ __all__ = [
+@@ -213,6 +221,7 @@ class InitializeRegistersPass(microprobe.passes.Pass):
+         skip_unknown = kwargs.get("skip_unknown", False)
+         warn_unknown = kwargs.get("warn_unknown", False)
+         self._force_code = kwargs.get("force_code", False)
++        self.lmul = kwargs.get("lmul", 1)
+ 
+         if len(args) == 1:
+             self._reg_dict = dict(
+@@ -242,7 +251,7 @@ class InitializeRegistersPass(microprobe.passes.Pass):
+             % (self._value, self._fp_value, v_value)
+         )
+ 
+-    def __call__(self, building_block, target):
++    def __call__(self, building_block: Benchmark, target: Target):
+         """
+ 
+         :param building_block:
+@@ -251,7 +260,7 @@ class InitializeRegistersPass(microprobe.passes.Pass):
+         """
+         if not self._skip_unknown:
+             for register_name in self._reg_dict:
+-                if register_name not in list(target.registers.keys()):
++                if register_name not in list(target.isa.registers.keys()):
+                     raise MicroprobeCodeGenerationError(
+                         f"Unknown register name: '{register_name}'. "
+                         "Unable to set it"
+@@ -259,7 +268,7 @@ class InitializeRegistersPass(microprobe.passes.Pass):
+ 
+         if self._warn_unknown:
+             for register_name in self._reg_dict:
+-                if register_name not in list(target.registers.keys()):
++                if register_name not in list(target.isa.registers.keys()):
+                     print_warning(
+                         f"Unknown register name: '{register_name}'. "
+                         "Unable to set it"
+@@ -275,7 +284,7 @@ class InitializeRegistersPass(microprobe.passes.Pass):
+         #
+         # Make sure scratch registers are set last
+         #
+-        for reg in target.scratch_registers:
++        for reg in target.isa.scratch_registers:
+             if reg in regs:
+                 regs.remove(reg)
+                 regs.append(reg)
+@@ -290,10 +299,22 @@ class InitializeRegistersPass(microprobe.passes.Pass):
+                 self._reg_dict.pop(reg.name)
+                 force_direct = True
+ 
+-            if (
+-                reg in building_block.context.reserved_registers
+-                and not self._force_reserved
+-            ):
++            if reg.name == "LMUL":
++                building_block.add_init(
++                    target.isa.set_register(reg, self.lmul,
++                                            building_block.context))
++                building_block.context.set_register_value(reg, self.lmul)
++                continue
++
++            all_vec_regs = set([f"V{i}" for i in range(0, 32)])
++            lmul_allowed_regs = set([f"V{i}" for i in range(0, 32, self.lmul)])
++
++            if reg.name in all_vec_regs - lmul_allowed_regs:
++                # Skip vector registers ignored by lmul
++                continue
++
++            if (reg in building_block.context.reserved_registers
++                    and not self._force_reserved):
+                 LOG.debug("Skip reserved - %s", reg)
+                 continue
+ 
+@@ -304,7 +325,7 @@ class InitializeRegistersPass(microprobe.passes.Pass):
+                 continue
+ 
+             if value is None:
+-                if reg.used_for_vector_arithmetic:
++                if reg.type.used_for_vector_arithmetic:
+                     if self._vect_value is not None:
+                         value = self._vect_value
+                         elemsize = self._vect_elemsize
+@@ -313,7 +334,7 @@ class InitializeRegistersPass(microprobe.passes.Pass):
+                             "Skip no vector default value provided - %s", reg
+                         )
+                         continue
+-                elif reg.used_for_float_arithmetic:
++                elif reg.type.used_for_float_arithmetic:
+                     if self._fp_value is not None:
+                         value = self._fp_value
+                     else:
+@@ -334,10 +355,10 @@ class InitializeRegistersPass(microprobe.passes.Pass):
+                 if isinstance(value, int):
+                     value = value & ((2**reg.size) - 1)
+ 
+-                if reg.used_for_float_arithmetic:
++                if reg.type.used_for_float_arithmetic:
+                     value = ieee_float_to_int64(float(value))
+ 
+-                elif reg.used_for_vector_arithmetic:
++                elif reg.type.used_for_vector_arithmetic:
+                     if isinstance(value, float):
+                         if elemsize != 64:
+                             raise MicroprobeCodeGenerationError(
+diff --git a/src/microprobe/target/isa/instruction.py b/src/microprobe/target/isa/instruction.py
+index 31bab71..9ba4001 100644
+--- a/src/microprobe/target/isa/instruction.py
++++ b/src/microprobe/target/isa/instruction.py
+@@ -1779,6 +1779,13 @@ class GenericInstructionType(InstructionType):
+                         "," + field.name + ")",
+                         "," + next_operand_value().representation + ")", 1)
+ 
++                elif assembly_str.find(" " + field.name + ".t") >= 0:
++                    assembly_str = assembly_str.replace(
++                        ", " + field.name + ".t",
++                        ", " + next_operand_value().representation + ".t",
++                        1,
++                    )
++
+                 else:
+                     LOG.debug(
+                         "%s",
+diff --git a/src/microprobe/target/isa/operand.py b/src/microprobe/target/isa/operand.py
+index 6a32724..e34d72a 100644
+--- a/src/microprobe/target/isa/operand.py
++++ b/src/microprobe/target/isa/operand.py
+@@ -16,12 +16,13 @@
+ """
+ 
+ # Futures
+-from __future__ import absolute_import, print_function
++from __future__ import absolute_import, print_function, annotations
+ 
+ # Built-in modules
+ import abc
+ import os
+ import random
++from typing import Dict, List, TYPE_CHECKING, cast
+ 
+ # Third party modules
+ 
+@@ -37,6 +38,10 @@ from microprobe.utils.misc import OrderedDict, natural_sort
+ from microprobe.utils.typeguard_decorator import typeguard_testsuite
+ from microprobe.utils.yaml import read_yaml
+ 
++# Type hinting
++if TYPE_CHECKING:
++    from microprobe.code.context import Context
++
+ # Constants
+ SCHEMA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schemas",
+                       "operand.yaml")
+@@ -283,7 +288,7 @@ class OperandDescriptor:
+ 
+     """
+ 
+-    def __init__(self, mtype, is_input, is_output):
++    def __init__(self, mtype: Operand, is_input, is_output):
+         """
+ 
+         :param mtype:
+@@ -310,7 +315,7 @@ class OperandDescriptor:
+         """Is output flag (:class:`~.bool`) """
+         return self._is_output
+ 
+-    def set_type(self, new_type):
++    def set_type(self, new_type: Operand):
+         """
+ 
+         :param new_type:
+@@ -614,7 +619,14 @@ class Operand(abc.ABC):
+         raise NotImplementedError
+ 
+     @abc.abstractmethod
+-    def values(self):
++    def values(self) -> List[Register]:
++        """Return the possible value of the operand."""
++        raise NotImplementedError
++
++    # TODO: Consider making filtered_values into values.
++    def filtered_values(
++        self, context: Context, fieldname: str
++    ) -> List[Register]:
+         """Return the possible value of the operand."""
+         raise NotImplementedError
+ 
+@@ -765,8 +777,14 @@ class OperandReg(Operand):
+ 
+     """
+ 
+-    def __init__(self, name, descr, regs, address_base, address_index,
+-                 floating_point, vector):
++    def __init__(self,
++                 name: str,
++                 descr: str,
++                 regs: List[Register] | Dict[Register, List[Register]],
++                 address_base,
++                 address_index: int,
++                 floating_point: bool | None,
++                 vector: bool | None):
+         """
+ 
+         :param name:
+@@ -781,7 +799,7 @@ class OperandReg(Operand):
+         super(OperandReg, self).__init__(name, descr)
+ 
+         if isinstance(regs, list):
+-            self._regs = OrderedDict()
++            self._regs: Dict[Register, List[Register]] = OrderedDict()
+             for reg in regs:
+                 self._regs[reg] = [reg]
+         else:
+@@ -807,6 +825,53 @@ class OperandReg(Operand):
+         """
+         return list(self._regs.keys())
+ 
++    def filtered_values(self, context: Context, fieldname: str):
++        lmul = cast(int | None, context.get_registername_value("LMUL"))
++
++        if lmul is None or not fieldname.startswith("v"):
++            return self.values()
++        elif fieldname in ["vd", "vmd", "vrs1", "vrs2", "vmask"]:
++            lmul *= 1
++        elif fieldname in ["vdd", "vdmd", "vdrs1", "vdrs2", "vnd", "vnmd"]:
++            lmul *= 2
++        elif fieldname in []:
++            lmul *= 4
++        elif fieldname in []:
++            lmul *= 8
++        else:
++            raise ValueError(f"Unhandled LMUL operand name: {fieldname}")
++
++        regs = list(self._regs.keys())
++
++        class LMULRegs:
++            lmul1 = regs
++            lmul2 = [
++                reg
++                for reg in self._regs.keys()
++                if reg.name in set([f"V{i}" for i in range(0, 32, 2)])
++            ]
++            lmul4 = [
++                reg
++                for reg in self._regs.keys()
++                if reg.name in set([f"V{i}" for i in range(0, 32, 4)])
++            ]
++            lmul8 = [
++                reg
++                for reg in self._regs.keys()
++                if reg.name in set([f"V{i}" for i in range(0, 32, 8)])
++            ]
++
++        if lmul == 1:
++            return LMULRegs.lmul1
++        elif lmul == 2:
++            return LMULRegs.lmul2
++        elif lmul == 4:
++            return LMULRegs.lmul4
++        elif lmul == 8:
++            return LMULRegs.lmul8
++        else:
++            raise ValueError(f"Unhandled LMUL value: {lmul}")
++
+     def representation(self, value):
+         """
+ 
+@@ -925,6 +990,11 @@ class OperandImmRange(Operand):
+             ]
+         return self._computed_values
+ 
++    def filtered_values(
++        self, context: Context, fieldname: str
++    ):
++        return super().filtered_values(context, fieldname)
++
+     def set_valid_values(self, values):
+         """
+ 
+@@ -1081,6 +1151,11 @@ class OperandValueSet(Operand):
+         """
+         return self._values
+ 
++    def filtered_values(
++        self, context: Context, fieldname: str
++    ):
++        return super().filtered_values(context, fieldname)
++
+     def representation(self, value):
+         """
+ 
+@@ -1175,6 +1250,11 @@ class OperandConst(Operand):
+         """
+         return [self._value]
+ 
++    def filtered_values(
++        self, context: Context, fieldname: str
++    ):
++        return super().filtered_values(context, fieldname)
++
+     def representation(self, value):
+         """
+ 
+@@ -1283,6 +1363,11 @@ class OperandConstReg(Operand):
+         """
+         return [self._reg]
+ 
++    def filtered_values(
++        self, context: Context, fieldname: str
++    ):
++        return super().filtered_values(context, fieldname)
++
+     def random_value(self, rand: random.Random):
+         """Return a random possible value for the operand.
+ 
+@@ -1391,6 +1476,11 @@ class InstructionAddressRelativeOperand(Operand):
+         """
+         return [self._mindispl << self._shift]
+ 
++    def filtered_values(
++        self, context: Context, fieldname: str
++    ):
++        return super().filtered_values(context, fieldname)
++
+     def random_value(self, rand: random.Random):
+         """Return a random possible value for the operand.
+ 
+diff --git a/targets/riscv/isa/riscv-common/instruction.yaml b/targets/riscv/isa/riscv-common/instruction.yaml
+index 69f601c..cd9dbe7 100644
+--- a/targets/riscv/isa/riscv-common/instruction.yaml
++++ b/targets/riscv/isa/riscv-common/instruction.yaml
+@@ -1771,7 +1771,7 @@
+   Format: "cl_w"
+   Operands:
+     funct3: ['2', 'funct3', '?']
+-    crs1: ['crega', 'crs1', 'I'] 
++    crs1: ['crega', 'crs1', 'I']
+   MemoryOperands:
+     MEM1 : [['cw_imm3', 'crs1'], [8], 8, 'I']
+ - Name: "C.LD_V0"
+@@ -1799,7 +1799,7 @@
+   Format: "cl_w"
+   Operands:
+     funct3: ['6', 'funct3', '?']
+-    crs1: ['crega', 'crs1', 'I'] 
++    crs1: ['crega', 'crs1', 'I']
+   MemoryOperands:
+     MEM1 : [['cw_imm3', 'crs1'], [8], 8, 'O']
+ - Name: "C.SD_V0"
+@@ -1808,7 +1808,7 @@
+   Format: "cl_d"
+   Operands:
+     funct3: ['7', 'funct3', '?']
+-    crs1: ['crega', 'crs1', 'I'] 
++    crs1: ['crega', 'crs1', 'I']
+   MemoryOperands:
+     MEM1 : [['cd_imm3', 'crs1'], [8], 8, 'O']
+ - Name: "C.NOP_V0"
+@@ -2081,3 +2081,2070 @@
+   Format: "csr"
+   Operands:
+     funct3: ['1', 'funct3', '?']
++# Manually added
++- Description: Set lmul
++  Format: vsetivli_lmul1
++  Mnemonic: vsetivli
++  Name: vsetivli_lmul1
++  Opcode: '0'
++- Description: Set lmul
++  Format: vsetivli_lmul2
++  Mnemonic: vsetivli
++  Name: vsetivli_lmul2
++  Opcode: '0'
++- Description: Set lmul
++  Format: vsetivli_lmul4
++  Mnemonic: vsetivli
++  Name: vsetivli_lmul4
++  Opcode: '0'
++- Description: Set lmul
++  Format: vsetivli_lmul8
++  Mnemonic: vsetivli
++  Name: vsetivli_lmul8
++  Opcode: '0'
++# Generated using parse_binutils_riscv.py
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: d-s-t_parsed
++  Mnemonic: VSETVL
++  Name: VSETVL_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-VtVm_parsed
++  Mnemonic: VNEG.V
++  Name: VNEG.V_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VADD.VV
++  Name: VADD.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VADD.VX
++  Name: VADD.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-ViVm_parsed
++  Mnemonic: VADD.VI
++  Name: VADD.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VSUB.VV
++  Name: VSUB.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VSUB.VX
++  Name: VSUB.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VRSUB.VX
++  Name: VRSUB.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-ViVm_parsed
++  Mnemonic: VRSUB.VI
++  Name: VRSUB.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-VtVm_wide_in_parsed
++  Mnemonic: VWCVT.X.X.V
++  Name: VWCVT.X.X.V_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-VtVm_wide_in_parsed
++  Mnemonic: VWCVTU.X.X.V
++  Name: VWCVTU.X.X.V_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_parsed
++  Mnemonic: VWADDU.VV
++  Name: VWADDU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_wide_in_parsed
++  Mnemonic: VWADDU.VX
++  Name: VWADDU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_parsed
++  Mnemonic: VWSUBU.VV
++  Name: VWSUBU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_wide_in_parsed
++  Mnemonic: VWSUBU.VX
++  Name: VWSUBU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_parsed
++  Mnemonic: VWADD.VV
++  Name: VWADD.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_wide_in_parsed
++  Mnemonic: VWADD.VX
++  Name: VWADD.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_parsed
++  Mnemonic: VWSUB.VV
++  Name: VWSUB.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_wide_in_parsed
++  Mnemonic: VWSUB.VX
++  Name: VWSUB.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_wide_out_parsed
++  Mnemonic: VWADDU.WV
++  Name: VWADDU.WV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_wide_in_wide_out_parsed
++  Mnemonic: VWADDU.WX
++  Name: VWADDU.WX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_wide_out_parsed
++  Mnemonic: VWSUBU.WV
++  Name: VWSUBU.WV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_wide_in_wide_out_parsed
++  Mnemonic: VWSUBU.WX
++  Name: VWSUBU.WX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_wide_out_parsed
++  Mnemonic: VWADD.WV
++  Name: VWADD.WV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_wide_in_wide_out_parsed
++  Mnemonic: VWADD.WX
++  Name: VWADD.WX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_wide_out_parsed
++  Mnemonic: VWSUB.WV
++  Name: VWSUB.WV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_wide_in_wide_out_parsed
++  Mnemonic: VWSUB.WX
++  Name: VWSUB.WX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs-V0_parsed
++  Mnemonic: VADC.VVM
++  Name: VADC.VVM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s-V0_parsed
++  Mnemonic: VADC.VXM
++  Name: VADC.VXM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi-V0_parsed
++  Mnemonic: VADC.VIM
++  Name: VADC.VIM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs-V0_parsed
++  Mnemonic: VMADC.VVM
++  Name: VMADC.VVM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s-V0_parsed
++  Mnemonic: VMADC.VXM
++  Name: VMADC.VXM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi-V0_parsed
++  Mnemonic: VMADC.VIM
++  Name: VMADC.VIM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMADC.VV
++  Name: VMADC.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMADC.VX
++  Name: VMADC.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi_parsed
++  Mnemonic: VMADC.VI
++  Name: VMADC.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs-V0_parsed
++  Mnemonic: VSBC.VVM
++  Name: VSBC.VVM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s-V0_parsed
++  Mnemonic: VSBC.VXM
++  Name: VSBC.VXM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs-V0_parsed
++  Mnemonic: VMSBC.VVM
++  Name: VMSBC.VVM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s-V0_parsed
++  Mnemonic: VMSBC.VXM
++  Name: VMSBC.VXM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMSBC.VV
++  Name: VMSBC.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMSBC.VX
++  Name: VMSBC.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-VtVm_parsed
++  Mnemonic: VNOT.V
++  Name: VNOT.V_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VAND.VV
++  Name: VAND.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VAND.VX
++  Name: VAND.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-ViVm_parsed
++  Mnemonic: VAND.VI
++  Name: VAND.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VOR.VV
++  Name: VOR.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VOR.VX
++  Name: VOR.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-ViVm_parsed
++  Mnemonic: VOR.VI
++  Name: VOR.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VXOR.VV
++  Name: VXOR.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VXOR.VX
++  Name: VXOR.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-ViVm_parsed
++  Mnemonic: VXOR.VI
++  Name: VXOR.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VSLL.VV
++  Name: VSLL.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VSLL.VX
++  Name: VSLL.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VjVm_parsed
++  Mnemonic: VSLL.VI
++  Name: VSLL.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VSRL.VV
++  Name: VSRL.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VSRL.VX
++  Name: VSRL.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VjVm_parsed
++  Mnemonic: VSRL.VI
++  Name: VSRL.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VSRA.VV
++  Name: VSRA.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VSRA.VX
++  Name: VSRA.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VjVm_parsed
++  Mnemonic: VSRA.VI
++  Name: VSRA.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-VtVm_wide_in_parsed
++  Mnemonic: VNCVT.X.X.W
++  Name: VNCVT.X.X.W_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_parsed
++  Mnemonic: VNSRL.WV
++  Name: VNSRL.WV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_wide_in_parsed
++  Mnemonic: VNSRL.WX
++  Name: VNSRL.WX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VjVm_wide_in_parsed
++  Mnemonic: VNSRL.WI
++  Name: VNSRL.WI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_parsed
++  Mnemonic: VNSRA.WV
++  Name: VNSRA.WV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_wide_in_parsed
++  Mnemonic: VNSRA.WX
++  Name: VNSRA.WX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VjVm_wide_in_parsed
++  Mnemonic: VNSRA.WI
++  Name: VNSRA.WI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VMSEQ.VV
++  Name: VMSEQ.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VMSEQ.VX
++  Name: VMSEQ.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-ViVm_parsed
++  Mnemonic: VMSEQ.VI
++  Name: VMSEQ.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VMSNE.VV
++  Name: VMSNE.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VMSNE.VX
++  Name: VMSNE.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-ViVm_parsed
++  Mnemonic: VMSNE.VI
++  Name: VMSNE.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VMSLTU.VV
++  Name: VMSLTU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VMSLTU.VX
++  Name: VMSLTU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VMSLT.VV
++  Name: VMSLT.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VMSLT.VX
++  Name: VMSLT.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VMSLEU.VV
++  Name: VMSLEU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VMSLEU.VX
++  Name: VMSLEU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-ViVm_parsed
++  Mnemonic: VMSLEU.VI
++  Name: VMSLEU.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VMSLE.VV
++  Name: VMSLE.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VMSLE.VX
++  Name: VMSLE.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-ViVm_parsed
++  Mnemonic: VMSLE.VI
++  Name: VMSLE.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VMSGTU.VX
++  Name: VMSGTU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-ViVm_parsed
++  Mnemonic: VMSGTU.VI
++  Name: VMSGTU.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VMSGT.VX
++  Name: VMSGT.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-ViVm_parsed
++  Mnemonic: VMSGT.VI
++  Name: VMSGT.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-VtVm_parsed
++  Mnemonic: VMSGT.VV
++  Name: VMSGT.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-VtVm_parsed
++  Mnemonic: VMSGTU.VV
++  Name: VMSGTU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-VtVm_parsed
++  Mnemonic: VMSGE.VV
++  Name: VMSGE.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-VtVm_parsed
++  Mnemonic: VMSGEU.VV
++  Name: VMSGEU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VkVm_parsed
++  Mnemonic: VMSLT.VI
++  Name: VMSLT.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VkVm_parsed
++  Mnemonic: VMSLTU.VI
++  Name: VMSLTU.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VkVm_parsed
++  Mnemonic: VMSGE.VI
++  Name: VMSGE.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VkVm_parsed
++  Mnemonic: VMSGEU.VI
++  Name: VMSGEU.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VMINU.VV
++  Name: VMINU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VMINU.VX
++  Name: VMINU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VMIN.VV
++  Name: VMIN.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VMIN.VX
++  Name: VMIN.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VMAXU.VV
++  Name: VMAXU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VMAXU.VX
++  Name: VMAXU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VMAX.VV
++  Name: VMAX.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VMAX.VX
++  Name: VMAX.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VMUL.VV
++  Name: VMUL.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VMUL.VX
++  Name: VMUL.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VMULH.VV
++  Name: VMULH.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VMULH.VX
++  Name: VMULH.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VMULHU.VV
++  Name: VMULHU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VMULHU.VX
++  Name: VMULHU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VMULHSU.VV
++  Name: VMULHSU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VMULHSU.VX
++  Name: VMULHSU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_parsed
++  Mnemonic: VWMUL.VV
++  Name: VWMUL.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_wide_in_parsed
++  Mnemonic: VWMUL.VX
++  Name: VWMUL.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_parsed
++  Mnemonic: VWMULU.VV
++  Name: VWMULU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_wide_in_parsed
++  Mnemonic: VWMULU.VX
++  Name: VWMULU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_parsed
++  Mnemonic: VWMULSU.VV
++  Name: VWMULSU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_wide_in_parsed
++  Mnemonic: VWMULSU.VX
++  Name: VWMULSU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-VtVm_parsed
++  Mnemonic: VMACC.VV
++  Name: VMACC.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s-VtVm_parsed
++  Mnemonic: VMACC.VX
++  Name: VMACC.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-VtVm_parsed
++  Mnemonic: VNMSAC.VV
++  Name: VNMSAC.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s-VtVm_parsed
++  Mnemonic: VNMSAC.VX
++  Name: VNMSAC.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-VtVm_parsed
++  Mnemonic: VMADD.VV
++  Name: VMADD.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s-VtVm_parsed
++  Mnemonic: VMADD.VX
++  Name: VMADD.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-VtVm_parsed
++  Mnemonic: VNMSUB.VV
++  Name: VNMSUB.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s-VtVm_parsed
++  Mnemonic: VNMSUB.VX
++  Name: VNMSUB.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-VtVm_wide_in_parsed
++  Mnemonic: VWMACCU.VV
++  Name: VWMACCU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s-VtVm_wide_in_parsed
++  Mnemonic: VWMACCU.VX
++  Name: VWMACCU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-VtVm_wide_in_parsed
++  Mnemonic: VWMACC.VV
++  Name: VWMACC.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s-VtVm_wide_in_parsed
++  Mnemonic: VWMACC.VX
++  Name: VWMACC.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-VtVm_wide_in_parsed
++  Mnemonic: VWMACCSU.VV
++  Name: VWMACCSU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s-VtVm_wide_in_parsed
++  Mnemonic: VWMACCSU.VX
++  Name: VWMACCSU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s-VtVm_wide_in_parsed
++  Mnemonic: VWMACCUS.VX
++  Name: VWMACCUS.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VDIVU.VV
++  Name: VDIVU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VDIVU.VX
++  Name: VDIVU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VDIV.VV
++  Name: VDIV.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VDIV.VX
++  Name: VDIV.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VREMU.VV
++  Name: VREMU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VREMU.VX
++  Name: VREMU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VREM.VV
++  Name: VREM.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VREM.VX
++  Name: VREM.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs-V0_parsed
++  Mnemonic: VMERGE.VVM
++  Name: VMERGE.VVM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s-V0_parsed
++  Mnemonic: VMERGE.VXM
++  Name: VMERGE.VXM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi-V0_parsed
++  Mnemonic: VMERGE.VIM
++  Name: VMERGE.VIM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs_parsed
++  Mnemonic: VMV.V.V
++  Name: VMV.V.V_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s_parsed
++  Mnemonic: VMV.V.X
++  Name: VMV.V.X_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vi_parsed
++  Mnemonic: VMV.V.I
++  Name: VMV.V.I_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VSADDU.VV
++  Name: VSADDU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VSADDU.VX
++  Name: VSADDU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-ViVm_parsed
++  Mnemonic: VSADDU.VI
++  Name: VSADDU.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VSADD.VV
++  Name: VSADD.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VSADD.VX
++  Name: VSADD.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-ViVm_parsed
++  Mnemonic: VSADD.VI
++  Name: VSADD.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VSSUBU.VV
++  Name: VSSUBU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VSSUBU.VX
++  Name: VSSUBU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VSSUB.VV
++  Name: VSSUB.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VSSUB.VX
++  Name: VSSUB.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VAADDU.VV
++  Name: VAADDU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VAADDU.VX
++  Name: VAADDU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VAADD.VV
++  Name: VAADD.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VAADD.VX
++  Name: VAADD.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VASUBU.VV
++  Name: VASUBU.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VASUBU.VX
++  Name: VASUBU.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VASUB.VV
++  Name: VASUB.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VASUB.VX
++  Name: VASUB.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VSMUL.VV
++  Name: VSMUL.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VSMUL.VX
++  Name: VSMUL.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VSSRL.VV
++  Name: VSSRL.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VSSRL.VX
++  Name: VSSRL.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VjVm_parsed
++  Mnemonic: VSSRL.VI
++  Name: VSSRL.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VSSRA.VV
++  Name: VSSRA.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VSSRA.VX
++  Name: VSSRA.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VjVm_parsed
++  Mnemonic: VSSRA.VI
++  Name: VSSRA.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_parsed
++  Mnemonic: VNCLIPU.WV
++  Name: VNCLIPU.WV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_wide_in_parsed
++  Mnemonic: VNCLIPU.WX
++  Name: VNCLIPU.WX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VjVm_wide_in_parsed
++  Mnemonic: VNCLIPU.WI
++  Name: VNCLIPU.WI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_parsed
++  Mnemonic: VNCLIP.WV
++  Name: VNCLIP.WV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_wide_in_parsed
++  Mnemonic: VNCLIP.WX
++  Name: VNCLIP.WX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VjVm_wide_in_parsed
++  Mnemonic: VNCLIP.WI
++  Name: VNCLIP.WI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VREDSUM.VS
++  Name: VREDSUM.VS_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VREDMAXU.VS
++  Name: VREDMAXU.VS_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VREDMAX.VS
++  Name: VREDMAX.VS_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VREDMINU.VS
++  Name: VREDMINU.VS_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VREDMIN.VS
++  Name: VREDMIN.VS_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VREDAND.VS
++  Name: VREDAND.VS_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VREDOR.VS
++  Name: VREDOR.VS_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VREDXOR.VS
++  Name: VREDXOR.VS_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_parsed
++  Mnemonic: VWREDSUMU.VS
++  Name: VWREDSUMU.VS_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_wide_in_parsed
++  Mnemonic: VWREDSUM.VS
++  Name: VWREDSUM.VS_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vu_parsed
++  Mnemonic: VMMV.M
++  Name: VMMV.M_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vu_parsed
++  Mnemonic: VMCPY.M
++  Name: VMCPY.M_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vv_parsed
++  Mnemonic: VMCLR.M
++  Name: VMCLR.M_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vv_parsed
++  Mnemonic: VMSET.M
++  Name: VMSET.M_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vu_parsed
++  Mnemonic: VMNOT.M
++  Name: VMNOT.M_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMAND.MM
++  Name: VMAND.MM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMNAND.MM
++  Name: VMNAND.MM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMANDN.MM
++  Name: VMANDN.MM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMANDNOT.MM
++  Name: VMANDNOT.MM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMXOR.MM
++  Name: VMXOR.MM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMOR.MM
++  Name: VMOR.MM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMNOR.MM
++  Name: VMNOR.MM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMORN.MM
++  Name: VMORN.MM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMORNOT.MM
++  Name: VMORNOT.MM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMXNOR.MM
++  Name: VMXNOR.MM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: d-VtVm_parsed
++  Mnemonic: VCPOP.M
++  Name: VCPOP.M_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: d-VtVm_parsed
++  Mnemonic: VPOPC.M
++  Name: VPOPC.M_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: d-VtVm_parsed
++  Mnemonic: VFIRST.M
++  Name: VFIRST.M_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-VtVm_parsed
++  Mnemonic: VMSBF.M
++  Name: VMSBF.M_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-VtVm_parsed
++  Mnemonic: VMSIF.M
++  Name: VMSIF.M_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-VtVm_parsed
++  Mnemonic: VMSOF.M
++  Name: VMSOF.M_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-VtVm_parsed
++  Mnemonic: VIOTA.M
++  Name: VIOTA.M_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: VdVm_parsed
++  Mnemonic: VID.V
++  Name: VID.V_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: d-Vt_parsed
++  Mnemonic: VMV.X.S
++  Name: VMV.X.S_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s_parsed
++  Mnemonic: VMV.S.X
++  Name: VMV.S.X_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VSLIDEUP.VX
++  Name: VSLIDEUP.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VjVm_parsed
++  Mnemonic: VSLIDEUP.VI
++  Name: VSLIDEUP.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VSLIDEDOWN.VX
++  Name: VSLIDEDOWN.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VjVm_parsed
++  Mnemonic: VSLIDEDOWN.VI
++  Name: VSLIDEDOWN.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VSLIDE1UP.VX
++  Name: VSLIDE1UP.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VSLIDE1DOWN.VX
++  Name: VSLIDE1DOWN.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VsVm_parsed
++  Mnemonic: VRGATHER.VV
++  Name: VRGATHER.VV_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-sVm_parsed
++  Mnemonic: VRGATHER.VX
++  Name: VRGATHER.VX_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-VjVm_parsed
++  Mnemonic: VRGATHER.VI
++  Name: VRGATHER.VI_V1
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VCOMPRESS.VM
++  Name: VCOMPRESS.VM_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt_parsed
++  Mnemonic: VMV1R.V
++  Name: VMV1R.V_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt_parsed
++  Mnemonic: VNEG.V
++  Name: VNEG.V_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VADD.VV
++  Name: VADD.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VADD.VX
++  Name: VADD.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi_parsed
++  Mnemonic: VADD.VI
++  Name: VADD.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VSUB.VV
++  Name: VSUB.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VSUB.VX
++  Name: VSUB.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VRSUB.VX
++  Name: VRSUB.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi_parsed
++  Mnemonic: VRSUB.VI
++  Name: VRSUB.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt_wide_in_parsed
++  Mnemonic: VWCVT.X.X.V
++  Name: VWCVT.X.X.V_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt_wide_in_parsed
++  Mnemonic: VWCVTU.X.X.V
++  Name: VWCVTU.X.X.V_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_parsed
++  Mnemonic: VWADDU.VV
++  Name: VWADDU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_wide_in_parsed
++  Mnemonic: VWADDU.VX
++  Name: VWADDU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_parsed
++  Mnemonic: VWSUBU.VV
++  Name: VWSUBU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_wide_in_parsed
++  Mnemonic: VWSUBU.VX
++  Name: VWSUBU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_parsed
++  Mnemonic: VWADD.VV
++  Name: VWADD.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_wide_in_parsed
++  Mnemonic: VWADD.VX
++  Name: VWADD.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_parsed
++  Mnemonic: VWSUB.VV
++  Name: VWSUB.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_wide_in_parsed
++  Mnemonic: VWSUB.VX
++  Name: VWSUB.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_wide_out_parsed
++  Mnemonic: VWADDU.WV
++  Name: VWADDU.WV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_wide_in_wide_out_parsed
++  Mnemonic: VWADDU.WX
++  Name: VWADDU.WX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_wide_out_parsed
++  Mnemonic: VWSUBU.WV
++  Name: VWSUBU.WV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_wide_in_wide_out_parsed
++  Mnemonic: VWSUBU.WX
++  Name: VWSUBU.WX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_wide_out_parsed
++  Mnemonic: VWADD.WV
++  Name: VWADD.WV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_wide_in_wide_out_parsed
++  Mnemonic: VWADD.WX
++  Name: VWADD.WX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_wide_out_parsed
++  Mnemonic: VWSUB.WV
++  Name: VWSUB.WV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_wide_in_wide_out_parsed
++  Mnemonic: VWSUB.WX
++  Name: VWSUB.WX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt_parsed
++  Mnemonic: VNOT.V
++  Name: VNOT.V_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VAND.VV
++  Name: VAND.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VAND.VX
++  Name: VAND.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi_parsed
++  Mnemonic: VAND.VI
++  Name: VAND.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VOR.VV
++  Name: VOR.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VOR.VX
++  Name: VOR.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi_parsed
++  Mnemonic: VOR.VI
++  Name: VOR.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VXOR.VV
++  Name: VXOR.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VXOR.VX
++  Name: VXOR.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi_parsed
++  Mnemonic: VXOR.VI
++  Name: VXOR.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VSLL.VV
++  Name: VSLL.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VSLL.VX
++  Name: VSLL.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vj_parsed
++  Mnemonic: VSLL.VI
++  Name: VSLL.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VSRL.VV
++  Name: VSRL.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VSRL.VX
++  Name: VSRL.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vj_parsed
++  Mnemonic: VSRL.VI
++  Name: VSRL.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VSRA.VV
++  Name: VSRA.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VSRA.VX
++  Name: VSRA.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vj_parsed
++  Mnemonic: VSRA.VI
++  Name: VSRA.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt_wide_in_parsed
++  Mnemonic: VNCVT.X.X.W
++  Name: VNCVT.X.X.W_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_parsed
++  Mnemonic: VNSRL.WV
++  Name: VNSRL.WV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_wide_in_parsed
++  Mnemonic: VNSRL.WX
++  Name: VNSRL.WX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vj_wide_in_parsed
++  Mnemonic: VNSRL.WI
++  Name: VNSRL.WI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_parsed
++  Mnemonic: VNSRA.WV
++  Name: VNSRA.WV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_wide_in_parsed
++  Mnemonic: VNSRA.WX
++  Name: VNSRA.WX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vj_wide_in_parsed
++  Mnemonic: VNSRA.WI
++  Name: VNSRA.WI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMSEQ.VV
++  Name: VMSEQ.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMSEQ.VX
++  Name: VMSEQ.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi_parsed
++  Mnemonic: VMSEQ.VI
++  Name: VMSEQ.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMSNE.VV
++  Name: VMSNE.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMSNE.VX
++  Name: VMSNE.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi_parsed
++  Mnemonic: VMSNE.VI
++  Name: VMSNE.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMSLTU.VV
++  Name: VMSLTU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMSLTU.VX
++  Name: VMSLTU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMSLT.VV
++  Name: VMSLT.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMSLT.VX
++  Name: VMSLT.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMSLEU.VV
++  Name: VMSLEU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMSLEU.VX
++  Name: VMSLEU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi_parsed
++  Mnemonic: VMSLEU.VI
++  Name: VMSLEU.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMSLE.VV
++  Name: VMSLE.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMSLE.VX
++  Name: VMSLE.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi_parsed
++  Mnemonic: VMSLE.VI
++  Name: VMSLE.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMSGTU.VX
++  Name: VMSGTU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi_parsed
++  Mnemonic: VMSGTU.VI
++  Name: VMSGTU.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMSGT.VX
++  Name: VMSGT.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi_parsed
++  Mnemonic: VMSGT.VI
++  Name: VMSGT.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-Vt_parsed
++  Mnemonic: VMSGT.VV
++  Name: VMSGT.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-Vt_parsed
++  Mnemonic: VMSGTU.VV
++  Name: VMSGTU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-Vt_parsed
++  Mnemonic: VMSGE.VV
++  Name: VMSGE.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-Vt_parsed
++  Mnemonic: VMSGEU.VV
++  Name: VMSGEU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vk_parsed
++  Mnemonic: VMSLT.VI
++  Name: VMSLT.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vk_parsed
++  Mnemonic: VMSLTU.VI
++  Name: VMSLTU.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vk_parsed
++  Mnemonic: VMSGE.VI
++  Name: VMSGE.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vk_parsed
++  Mnemonic: VMSGEU.VI
++  Name: VMSGEU.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMINU.VV
++  Name: VMINU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMINU.VX
++  Name: VMINU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMIN.VV
++  Name: VMIN.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMIN.VX
++  Name: VMIN.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMAXU.VV
++  Name: VMAXU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMAXU.VX
++  Name: VMAXU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMAX.VV
++  Name: VMAX.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMAX.VX
++  Name: VMAX.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMUL.VV
++  Name: VMUL.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMUL.VX
++  Name: VMUL.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMULH.VV
++  Name: VMULH.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMULH.VX
++  Name: VMULH.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMULHU.VV
++  Name: VMULHU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMULHU.VX
++  Name: VMULHU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VMULHSU.VV
++  Name: VMULHSU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VMULHSU.VX
++  Name: VMULHSU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_parsed
++  Mnemonic: VWMUL.VV
++  Name: VWMUL.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_wide_in_parsed
++  Mnemonic: VWMUL.VX
++  Name: VWMUL.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_parsed
++  Mnemonic: VWMULU.VV
++  Name: VWMULU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_wide_in_parsed
++  Mnemonic: VWMULU.VX
++  Name: VWMULU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_parsed
++  Mnemonic: VWMULSU.VV
++  Name: VWMULSU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_wide_in_parsed
++  Mnemonic: VWMULSU.VX
++  Name: VWMULSU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-Vt_parsed
++  Mnemonic: VMACC.VV
++  Name: VMACC.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s-Vt_parsed
++  Mnemonic: VMACC.VX
++  Name: VMACC.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-Vt_parsed
++  Mnemonic: VNMSAC.VV
++  Name: VNMSAC.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s-Vt_parsed
++  Mnemonic: VNMSAC.VX
++  Name: VNMSAC.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-Vt_parsed
++  Mnemonic: VMADD.VV
++  Name: VMADD.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s-Vt_parsed
++  Mnemonic: VMADD.VX
++  Name: VMADD.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-Vt_parsed
++  Mnemonic: VNMSUB.VV
++  Name: VNMSUB.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s-Vt_parsed
++  Mnemonic: VNMSUB.VX
++  Name: VNMSUB.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-Vt_wide_in_parsed
++  Mnemonic: VWMACCU.VV
++  Name: VWMACCU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s-Vt_wide_in_parsed
++  Mnemonic: VWMACCU.VX
++  Name: VWMACCU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-Vt_wide_in_parsed
++  Mnemonic: VWMACC.VV
++  Name: VWMACC.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s-Vt_wide_in_parsed
++  Mnemonic: VWMACC.VX
++  Name: VWMACC.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vs-Vt_wide_in_parsed
++  Mnemonic: VWMACCSU.VV
++  Name: VWMACCSU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s-Vt_wide_in_parsed
++  Mnemonic: VWMACCSU.VX
++  Name: VWMACCSU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-s-Vt_wide_in_parsed
++  Mnemonic: VWMACCUS.VX
++  Name: VWMACCUS.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VDIVU.VV
++  Name: VDIVU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VDIVU.VX
++  Name: VDIVU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VDIV.VV
++  Name: VDIV.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VDIV.VX
++  Name: VDIV.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VREMU.VV
++  Name: VREMU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VREMU.VX
++  Name: VREMU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VREM.VV
++  Name: VREM.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VREM.VX
++  Name: VREM.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VSADDU.VV
++  Name: VSADDU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VSADDU.VX
++  Name: VSADDU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi_parsed
++  Mnemonic: VSADDU.VI
++  Name: VSADDU.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VSADD.VV
++  Name: VSADD.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VSADD.VX
++  Name: VSADD.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vi_parsed
++  Mnemonic: VSADD.VI
++  Name: VSADD.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VSSUBU.VV
++  Name: VSSUBU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VSSUBU.VX
++  Name: VSSUBU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VSSUB.VV
++  Name: VSSUB.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VSSUB.VX
++  Name: VSSUB.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VAADDU.VV
++  Name: VAADDU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VAADDU.VX
++  Name: VAADDU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VAADD.VV
++  Name: VAADD.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VAADD.VX
++  Name: VAADD.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VASUBU.VV
++  Name: VASUBU.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VASUBU.VX
++  Name: VASUBU.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VASUB.VV
++  Name: VASUB.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VASUB.VX
++  Name: VASUB.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VSMUL.VV
++  Name: VSMUL.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VSMUL.VX
++  Name: VSMUL.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VSSRL.VV
++  Name: VSSRL.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VSSRL.VX
++  Name: VSSRL.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vj_parsed
++  Mnemonic: VSSRL.VI
++  Name: VSSRL.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VSSRA.VV
++  Name: VSSRA.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VSSRA.VX
++  Name: VSSRA.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vj_parsed
++  Mnemonic: VSSRA.VI
++  Name: VSSRA.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_parsed
++  Mnemonic: VNCLIPU.WV
++  Name: VNCLIPU.WV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_wide_in_parsed
++  Mnemonic: VNCLIPU.WX
++  Name: VNCLIPU.WX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vj_wide_in_parsed
++  Mnemonic: VNCLIPU.WI
++  Name: VNCLIPU.WI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_parsed
++  Mnemonic: VNCLIP.WV
++  Name: VNCLIP.WV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_wide_in_parsed
++  Mnemonic: VNCLIP.WX
++  Name: VNCLIP.WX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vj_wide_in_parsed
++  Mnemonic: VNCLIP.WI
++  Name: VNCLIP.WI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VREDSUM.VS
++  Name: VREDSUM.VS_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VREDMAXU.VS
++  Name: VREDMAXU.VS_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VREDMAX.VS
++  Name: VREDMAX.VS_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VREDMINU.VS
++  Name: VREDMINU.VS_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VREDMIN.VS
++  Name: VREDMIN.VS_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VREDAND.VS
++  Name: VREDAND.VS_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VREDOR.VS
++  Name: VREDOR.VS_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VREDXOR.VS
++  Name: VREDXOR.VS_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_parsed
++  Mnemonic: VWREDSUMU.VS
++  Name: VWREDSUMU.VS_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_wide_in_parsed
++  Mnemonic: VWREDSUM.VS
++  Name: VWREDSUM.VS_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: d-Vt_parsed
++  Mnemonic: VCPOP.M
++  Name: VCPOP.M_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: d-Vt_parsed
++  Mnemonic: VPOPC.M
++  Name: VPOPC.M_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: d-Vt_parsed
++  Mnemonic: VFIRST.M
++  Name: VFIRST.M_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt_parsed
++  Mnemonic: VMSBF.M
++  Name: VMSBF.M_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt_parsed
++  Mnemonic: VMSIF.M
++  Name: VMSIF.M_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt_parsed
++  Mnemonic: VMSOF.M
++  Name: VMSOF.M_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt_parsed
++  Mnemonic: VIOTA.M
++  Name: VIOTA.M_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd_parsed
++  Mnemonic: VID.V
++  Name: VID.V_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VSLIDEUP.VX
++  Name: VSLIDEUP.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vj_parsed
++  Mnemonic: VSLIDEUP.VI
++  Name: VSLIDEUP.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VSLIDEDOWN.VX
++  Name: VSLIDEDOWN.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vj_parsed
++  Mnemonic: VSLIDEDOWN.VI
++  Name: VSLIDEDOWN.VI_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VSLIDE1UP.VX
++  Name: VSLIDE1UP.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VSLIDE1DOWN.VX
++  Name: VSLIDE1DOWN.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vs_parsed
++  Mnemonic: VRGATHER.VV
++  Name: VRGATHER.VV_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-s_parsed
++  Mnemonic: VRGATHER.VX
++  Name: VRGATHER.VX_V0
++  Opcode: '0'
++- Description: Auto parsed from binutils. Opcode is dummy data
++  Format: Vd-Vt-Vj_parsed
++  Mnemonic: VRGATHER.VI
++  Name: VRGATHER.VI_V0
++  Opcode: '0'
+diff --git a/targets/riscv/isa/riscv-common/instruction_field.yaml b/targets/riscv/isa/riscv-common/instruction_field.yaml
+index 2b35b95..de379ba 100644
+--- a/targets/riscv/isa/riscv-common/instruction_field.yaml
++++ b/targets/riscv/isa/riscv-common/instruction_field.yaml
+@@ -83,6 +83,12 @@
+   Show: False
+   IO: "I"
+   Operand: "imm10"
++- Name: "funct20"
++  Size: 20
++  Description: "funct20"
++  Show: False
++  IO: "?"
++  Operand: "imm20"
+ - Name: "funct25"
+   Size: 25
+   Description: "funct25"
+@@ -101,6 +107,18 @@
+   Show: True
+   IO: "I"
+   Operand: "u.imm12"
++- Name: "i_imm5"
++  Size: 5
++  Description: "imm5"
++  Show: True
++  IO: "I"
++  Operand: "simm5"
++- Name: "ioff_imm5"
++  Size: 5
++  Description: "imm5 offset by 1"
++  Show: True
++  IO: "I"
++  Operand: "soimm5"
+ - Name: "i_imm6"
+   Size: 6
+   Description: "i_imm6"
+@@ -483,3 +501,70 @@
+   Show: True
+   IO: "I"
+   Operand: "spreg"
++# Vector
++- Name: "vd"
++  Size: 5
++  Description: "vd"
++  Show: True
++  IO: "O"
++  Operand: "vreg"
++- Name: "vmd"
++  Size: 5
++  Description: "vd excluding V0"
++  Show: True
++  IO: "O"
++  Operand: "vnotmask"
++- Name: "vrs1"
++  Size: 5
++  Description: "vrs1"
++  Show: True
++  IO: "I"
++  Operand: "vreg"
++- Name: "vrs2"
++  Size: 5
++  Description: "vrs2"
++  Show: True
++  IO: "I"
++  Operand: "vreg"
++- Name: "vmask"
++  Size: 5
++  Description: "vmask"
++  Show: True
++  IO: "I"
++  Operand: "vmask"
++- Name: "vdd"
++  Size: 5
++  Description: "vd double the lmul"
++  Show: True
++  IO: "O"
++  Operand: "vreg"
++- Name: "vdmd"
++  Size: 5
++  Description: "vd excluding V0 double the lmul"
++  Show: True
++  IO: "O"
++  Operand: "vnotmask"
++- Name: "vnd"
++  Size: 5
++  Description: "vd narrowing insn"
++  Show: True
++  IO: "O"
++  Operand: "vreg"
++- Name: "vnmd"
++  Size: 5
++  Description: "vd excluding V0 narrowing insn"
++  Show: True
++  IO: "O"
++  Operand: "vnotmask"
++- Name: "vdrs1"
++  Size: 5
++  Description: "vrs1 double the lmul"
++  Show: True
++  IO: "I"
++  Operand: "vreg"
++- Name: "vdrs2"
++  Size: 5
++  Description: "vrs2  double the lmul"
++  Show: True
++  IO: "I"
++  Operand: "vreg"
+diff --git a/targets/riscv/isa/riscv-common/instruction_format.yaml b/targets/riscv/isa/riscv-common/instruction_format.yaml
+index 6c52873..3f8ea93 100644
+--- a/targets/riscv/isa/riscv-common/instruction_format.yaml
++++ b/targets/riscv/isa/riscv-common/instruction_format.yaml
+@@ -35,7 +35,7 @@
+   - funct3
+   - rd
+   - opcode
+-  Assembly: OPC rd, i_imm12(rs1) 
++  Assembly: OPC rd, i_imm12(rs1)
+ - Name: "i+lf"
+   Fields:
+   - i_imm12
+@@ -43,7 +43,7 @@
+   - funct3
+   - frd
+   - opcode
+-  Assembly: OPC frd, i_imm12(rs1) 
++  Assembly: OPC frd, i_imm12(rs1)
+ - Name: "i+o"
+   Fields:
+   - i_imm12
+@@ -77,7 +77,7 @@
+   - funct3
+   - rdc
+   - opcode
+-  Assembly: OPC 
++  Assembly: OPC
+ - Name: "r"
+   Fields:
+   - funct5
+@@ -158,7 +158,7 @@
+   - funct3
+   - rd
+   - opcode
+-  Assembly: OPC rd, rs2,  (rs1) 
++  Assembly: OPC rd, rs2,  (rs1)
+ - Name: "r-f"
+   Fields:
+   - imm4
+@@ -179,7 +179,7 @@
+   - funct3
+   - rd
+   - opcode
+-  Assembly: OPC rd,  (rs1) 
++  Assembly: OPC rd,  (rs1)
+ - Name: "r-l2"
+   Fields:
+   - funct5
+@@ -190,7 +190,7 @@
+   - funct3
+   - rd
+   - opcode
+-  Assembly: OPC rd,  (rs1) 
++  Assembly: OPC rd,  (rs1)
+ - Name: "r-m+3f"
+   Fields:
+   - funct5
+@@ -359,7 +359,7 @@
+   - funct3
+   - s_imm5
+   - opcode
+-  Assembly: OPC rs2, s_imm12(rs1) 
++  Assembly: OPC rs2, s_imm12(rs1)
+ - Name: "s+f"
+   Fields:
+   - s_imm7
+@@ -368,7 +368,7 @@
+   - funct3
+   - s_imm5
+   - opcode
+-  Assembly: OPC frs2, s_imm12(rs1) 
++  Assembly: OPC frs2, s_imm12(rs1)
+ - Name: "sb"
+   Fields:
+   - sb_imm7
+@@ -606,3 +606,398 @@
+   - rd
+   - opcode
+   Assembly: OPC rd, u_imm12, rs1
++# Manually added
++- Assembly: OPC zero,16,m1,ta,ma
++  Fields:
++  - funct25
++  - opcode
++  Name: vsetivli_lmul1
++- Assembly: OPC zero,16,m2,ta,ma
++  Fields:
++  - funct25
++  - opcode
++  Name: vsetivli_lmul2
++- Assembly: OPC zero,16,m4,ta,ma
++  Fields:
++  - funct25
++  - opcode
++  Name: vsetivli_lmul4
++- Assembly: OPC zero,16,m8,ta,ma
++  Fields:
++  - funct25
++  - opcode
++  Name: vsetivli_lmul8
++# Generated using parse_binutils_riscv.py
++- Assembly: OPC vd, i_imm5
++  Fields:
++  - funct10
++  - funct5
++  - vd
++  - i_imm5
++  - opcode
++  Name: Vd-Vi_parsed
++- Assembly: OPC vmd, vrs1, vrs2, vmask.t
++  Fields:
++  - vmd
++  - vrs1
++  - vrs2
++  - opcode
++  - vmask
++  - funct5
++  Name: Vd-Vs-VtVm_parsed
++- Assembly: OPC vnmd, vrs1, vdrs2, vmask.t
++  Fields:
++  - vnmd
++  - vrs1
++  - vdrs2
++  - opcode
++  - vmask
++  - funct5
++  Name: Vd-Vs-VtVm_wide_in_parsed
++- Assembly: OPC vd, vrs1, vrs2
++  Fields:
++  - funct10
++  - vd
++  - vrs1
++  - vrs2
++  - opcode
++  Name: Vd-Vs-Vt_parsed
++- Assembly: OPC vnd, vrs1, vdrs2
++  Fields:
++  - funct10
++  - vnd
++  - vrs1
++  - vdrs2
++  - opcode
++  Name: Vd-Vs-Vt_wide_in_parsed
++- Assembly: OPC vd, vrs1
++  Fields:
++  - funct10
++  - funct5
++  - vd
++  - vrs1
++  - opcode
++  Name: Vd-Vs_parsed
++- Assembly: OPC vmd, vrs2, i_imm5, vmask
++  Fields:
++  - funct5
++  - vmd
++  - vrs2
++  - i_imm5
++  - vmask
++  - opcode
++  Name: Vd-Vt-Vi-V0_parsed
++- Assembly: OPC vmd, vrs2, i_imm5, vmask.t
++  Fields:
++  - vmd
++  - vrs2
++  - i_imm5
++  - opcode
++  - vmask
++  - funct5
++  Name: Vd-Vt-ViVm_parsed
++- Assembly: OPC vd, vrs2, i_imm5
++  Fields:
++  - funct10
++  - vd
++  - vrs2
++  - i_imm5
++  - opcode
++  Name: Vd-Vt-Vi_parsed
++- Assembly: OPC vmd, vrs2, i_shamt5, vmask.t
++  Fields:
++  - vmd
++  - vrs2
++  - i_shamt5
++  - opcode
++  - vmask
++  - funct5
++  Name: Vd-Vt-VjVm_parsed
++- Assembly: OPC vnmd, vdrs2, i_shamt5, vmask.t
++  Fields:
++  - vnmd
++  - vdrs2
++  - i_shamt5
++  - opcode
++  - vmask
++  - funct5
++  Name: Vd-Vt-VjVm_wide_in_parsed
++- Assembly: OPC vd, vrs2, i_shamt5
++  Fields:
++  - funct10
++  - vd
++  - vrs2
++  - i_shamt5
++  - opcode
++  Name: Vd-Vt-Vj_parsed
++- Assembly: OPC vnd, vdrs2, i_shamt5
++  Fields:
++  - funct10
++  - vnd
++  - vdrs2
++  - i_shamt5
++  - opcode
++  Name: Vd-Vt-Vj_wide_in_parsed
++- Assembly: OPC vmd, vrs2, ioff_imm5, vmask.t
++  Fields:
++  - vmd
++  - vrs2
++  - ioff_imm5
++  - opcode
++  - vmask
++  - funct5
++  Name: Vd-Vt-VkVm_parsed
++- Assembly: OPC vd, vrs2, ioff_imm5
++  Fields:
++  - funct10
++  - vd
++  - vrs2
++  - ioff_imm5
++  - opcode
++  Name: Vd-Vt-Vk_parsed
++- Assembly: OPC vmd, vrs1, vrs2, vmask
++  Fields:
++  - funct5
++  - vmd
++  - vrs2
++  - vrs1
++  - vmask
++  - opcode
++  Name: Vd-Vt-Vs-V0_parsed
++- Assembly: OPC vmd, vrs2, vrs1, vmask.t
++  Fields:
++  - vmd
++  - vrs2
++  - vrs1
++  - opcode
++  - vmask
++  - funct5
++  Name: Vd-Vt-VsVm_parsed
++- Assembly: OPC vnmd, vdrs2, vrs1, vmask.t
++  Fields:
++  - vnmd
++  - vdrs2
++  - vrs1
++  - opcode
++  - vmask
++  - funct5
++  Name: Vd-Vt-VsVm_wide_in_parsed
++- Assembly: OPC vdmd, vdrs2, vrs1, vmask.t
++  Fields:
++  - vdmd
++  - vdrs2
++  - vrs1
++  - opcode
++  - vmask
++  - funct5
++  Name: Vd-Vt-VsVm_wide_in_wide_out_parsed
++- Assembly: OPC vd, vrs2, vrs1
++  Fields:
++  - funct10
++  - vd
++  - vrs2
++  - vrs1
++  - opcode
++  Name: Vd-Vt-Vs_parsed
++- Assembly: OPC vnd, vdrs2, vrs1
++  Fields:
++  - funct10
++  - vnd
++  - vdrs2
++  - vrs1
++  - opcode
++  Name: Vd-Vt-Vs_wide_in_parsed
++- Assembly: OPC vdd, vdrs2, vrs1
++  Fields:
++  - funct10
++  - vdd
++  - vdrs2
++  - vrs1
++  - opcode
++  Name: Vd-Vt-Vs_wide_in_wide_out_parsed
++- Assembly: OPC vmd, vrs2, rs1, vmask
++  Fields:
++  - funct5
++  - vmd
++  - vrs2
++  - rs1
++  - vmask
++  - opcode
++  Name: Vd-Vt-s-V0_parsed
++- Assembly: OPC vmd, vrs2, rs1, vmask.t
++  Fields:
++  - vmd
++  - vrs2
++  - rs1
++  - opcode
++  - vmask
++  - funct5
++  Name: Vd-Vt-sVm_parsed
++- Assembly: OPC vnmd, vdrs2, rs1, vmask.t
++  Fields:
++  - vnmd
++  - vdrs2
++  - rs1
++  - opcode
++  - vmask
++  - funct5
++  Name: Vd-Vt-sVm_wide_in_parsed
++- Assembly: OPC vdmd, vdrs2, rs1, vmask.t
++  Fields:
++  - vdmd
++  - vdrs2
++  - rs1
++  - opcode
++  - vmask
++  - funct5
++  Name: Vd-Vt-sVm_wide_in_wide_out_parsed
++- Assembly: OPC vd, vrs2, rs1
++  Fields:
++  - funct10
++  - vd
++  - vrs2
++  - rs1
++  - opcode
++  Name: Vd-Vt-s_parsed
++- Assembly: OPC vnd, vdrs2, rs1
++  Fields:
++  - funct10
++  - vnd
++  - vdrs2
++  - rs1
++  - opcode
++  Name: Vd-Vt-s_wide_in_parsed
++- Assembly: OPC vdd, vdrs2, rs1
++  Fields:
++  - funct10
++  - vdd
++  - vdrs2
++  - rs1
++  - opcode
++  Name: Vd-Vt-s_wide_in_wide_out_parsed
++- Assembly: OPC vmd, vrs2, vmask.t
++  Fields:
++  - funct10
++  - vmd
++  - vrs2
++  - opcode
++  - vmask
++  Name: Vd-VtVm_parsed
++- Assembly: OPC vnmd, vdrs2, vmask.t
++  Fields:
++  - funct10
++  - vnmd
++  - vdrs2
++  - opcode
++  - vmask
++  Name: Vd-VtVm_wide_in_parsed
++- Assembly: OPC vd, vrs2
++  Fields:
++  - funct10
++  - funct5
++  - vd
++  - vrs2
++  - opcode
++  Name: Vd-Vt_parsed
++- Assembly: OPC vnd, vdrs2
++  Fields:
++  - funct10
++  - funct5
++  - vnd
++  - vdrs2
++  - opcode
++  Name: Vd-Vt_wide_in_parsed
++- Assembly: OPC vd, vrs1
++  Fields:
++  - funct10
++  - funct5
++  - vd
++  - vrs1
++  - opcode
++  Name: Vd-Vu_parsed
++- Assembly: OPC vmd, rs1, vrs2, vmask.t
++  Fields:
++  - vmd
++  - vrs2
++  - rs1
++  - opcode
++  - vmask
++  - funct5
++  Name: Vd-s-VtVm_parsed
++- Assembly: OPC vnmd, rs1, vdrs2, vmask.t
++  Fields:
++  - vnmd
++  - vdrs2
++  - rs1
++  - opcode
++  - vmask
++  - funct5
++  Name: Vd-s-VtVm_wide_in_parsed
++- Assembly: OPC vd, rs1, vrs2
++  Fields:
++  - funct10
++  - vd
++  - vrs2
++  - rs1
++  - opcode
++  Name: Vd-s-Vt_parsed
++- Assembly: OPC vnd, rs1, vdrs2
++  Fields:
++  - funct10
++  - vnd
++  - vdrs2
++  - rs1
++  - opcode
++  Name: Vd-s-Vt_wide_in_parsed
++- Assembly: OPC vd, rs1
++  Fields:
++  - funct10
++  - funct5
++  - vd
++  - rs1
++  - opcode
++  Name: Vd-s_parsed
++- Assembly: OPC vmd, vmask.t
++  Fields:
++  - vmd
++  - opcode
++  - vmask
++  - funct10
++  - funct5
++  Name: VdVm_parsed
++- Assembly: OPC vd
++  Fields:
++  - funct20
++  - vd
++  - opcode
++  Name: Vd_parsed
++- Assembly: OPC vd
++  Fields:
++  - funct20
++  - vd
++  - opcode
++  Name: Vv_parsed
++- Assembly: OPC rd, vrs2, vmask.t
++  Fields:
++  - funct10
++  - rd
++  - vrs2
++  - vmask
++  - opcode
++  Name: d-VtVm_parsed
++- Assembly: OPC rd, vrs2
++  Fields:
++  - funct10
++  - funct5
++  - rd
++  - vrs2
++  - opcode
++  Name: d-Vt_parsed
++- Assembly: OPC rd, rs1, rs2
++  Fields:
++  - funct10
++  - rs1
++  - rs2
++  - rd
++  - opcode
++  Name: d-s-t_parsed
+diff --git a/targets/riscv/isa/riscv-common/isa.py b/targets/riscv/isa/riscv-common/isa.py
+index 8d6506e..2bf31f5 100644
+--- a/targets/riscv/isa/riscv-common/isa.py
++++ b/targets/riscv/isa/riscv-common/isa.py
+@@ -66,6 +66,7 @@ class RISCVISA(GenericISA):
+         self._scratch_registers += [
+             self.registers["X31"],
+             self.registers["F7"],
++            self.registers["V31"],
+         ]
+         self._control_registers += [
+             reg for reg in self.registers.values() if reg.type.name == "rm"
+@@ -232,9 +233,48 @@ class RISCVISA(GenericISA):
+                 instr.set_operands([int(value & 0x3FF), register, register])
+                 instrs.append(instr)
+ 
+-        else:
++        elif register.type.name == "vreg":
++            LOG.debug("Vector register")
++
++            if present_reg is not None:
++                LOG.debug("Value already present")
++
++                instr = self.new_instruction("VMV.V.V_V0")
++                instr.set_operands([register, present_reg])
++                instrs.append(instr)
++
++            else:
++                # Load the value into the vector register 1 chunk at a time.
++
++                chunks = [
++                    (value >> 1024 - (64 * i)) & 0xFFFFFFFFFFFFFFFF
++                    for i in range(1, 17)
++                ]
++
++                for chunk in chunks:
++                    # Set int register to chunk
++                    instrs.extend(
++                        self.set_register(
++                            self._scratch_registers[0], chunk, context)
++                    )
++
++                    # Shift existing vector register value and insert chunk
++                    shiftleft = self.new_instruction("VSLIDE1UP.VX_V0")
++                    shiftleft.set_operands(
++                        [register, register, self._scratch_registers[0]]
++                    )
++                    instrs.append(shiftleft)
++
+             LOG.debug("Register: %s set to value %d", register.name, value)
+-            raise NotImplementedError
++        elif register.type.name == "LMUL" and value in [1, 2, 4, 8]:
++            vset = self.new_instruction(f"vsetivli_lmul{value}")
++            instrs.append(vset)
++            LOG.debug("Register: %s set to value %d", register.name, value)
++        else:
++            raise NotImplementedError(
++                "Microprobe doesn't know how to initialize "
++                f"{register.type.name} register with value {value}."
++            )
+ 
+         if len(instrs) > 0:
+             return instrs
+diff --git a/targets/riscv/isa/riscv-common/operand.yaml b/targets/riscv/isa/riscv-common/operand.yaml
+index 64b06e1..ed831b7 100644
+--- a/targets/riscv/isa/riscv-common/operand.yaml
++++ b/targets/riscv/isa/riscv-common/operand.yaml
+@@ -98,6 +98,10 @@
+   Description: 5-bit immediate (signed)
+   Min: -16
+   Max: 15
++- Name: soimm5
++  Description: 5-bit immediate offset by 1 (signed)
++  Min: -15
++  Max: 16
+ - Name: simm6
+   Description: 6-bit immediate (signed)
+   Min: -32
+@@ -553,3 +557,76 @@
+     - 0xffffd
+     - 0xffffe
+     - 0xfffff
++- Name: vreg
++  Description: Vector Registers
++  Registers:
++    V0 : ['V0']
++    V1 : ['V1']
++    V2 : ['V2']
++    V3 : ['V3']
++    V4 : ['V4']
++    V5 : ['V5']
++    V6 : ['V6']
++    V7 : ['V7']
++    V8 : ['V8']
++    V9 : ['V9']
++    V10 : ['V10']
++    V11 : ['V11']
++    V12 : ['V12']
++    V13 : ['V13']
++    V14 : ['V14']
++    V15 : ['V15']
++    V16 : ['V16']
++    V17 : ['V17']
++    V18 : ['V18']
++    V19 : ['V19']
++    V20 : ['V20']
++    V21 : ['V21']
++    V22 : ['V22']
++    V23 : ['V23']
++    V24 : ['V24']
++    V25 : ['V25']
++    V26 : ['V26']
++    V27 : ['V27']
++    V28 : ['V28']
++    V29 : ['V29']
++    V30 : ['V30']
++    V31 : ['V31']
++- Name: vnotmask
++  Description: Vector Registers excluding mask
++  Registers:
++    V1 : ['V1']
++    V2 : ['V2']
++    V3 : ['V3']
++    V4 : ['V4']
++    V5 : ['V5']
++    V6 : ['V6']
++    V7 : ['V7']
++    V8 : ['V8']
++    V9 : ['V9']
++    V10 : ['V10']
++    V11 : ['V11']
++    V12 : ['V12']
++    V13 : ['V13']
++    V14 : ['V14']
++    V15 : ['V15']
++    V16 : ['V16']
++    V17 : ['V17']
++    V18 : ['V18']
++    V19 : ['V19']
++    V20 : ['V20']
++    V21 : ['V21']
++    V22 : ['V22']
++    V23 : ['V23']
++    V24 : ['V24']
++    V25 : ['V25']
++    V26 : ['V26']
++    V27 : ['V27']
++    V28 : ['V28']
++    V29 : ['V29']
++    V30 : ['V30']
++    V31 : ['V31']
++- Name: vmask
++  Description: Vector mask
++  Registers:
++    V0 : ['V0']
+diff --git a/targets/riscv/isa/riscv-common/register.yaml b/targets/riscv/isa/riscv-common/register.yaml
+index 94fe3de..b9b5273 100644
+--- a/targets/riscv/isa/riscv-common/register.yaml
++++ b/targets/riscv/isa/riscv-common/register.yaml
+@@ -27,7 +27,19 @@
+   Repeat:
+     From: 0
+     To: 31
++- Name: V0
++  Type: vreg
++  Representation: 'v0'
++  Codification: '0'
++  Description: Vector Register 0
++  Repeat:
++    From: 0
++    To: 31
+ - Name: PC
+   Type: SPR
+   Representation: 'N/A'
+   Description: Program Counter register
++- Name: LMUL
++  Type: LMUL
++  Representation: 'N/A'
++  Description: LMUL register
+diff --git a/targets/riscv/isa/riscv-common/register_type.yaml b/targets/riscv/isa/riscv-common/register_type.yaml
+index c23d708..5059678 100644
+--- a/targets/riscv/isa/riscv-common/register_type.yaml
++++ b/targets/riscv/isa/riscv-common/register_type.yaml
+@@ -19,6 +19,12 @@
+   Size: 64
+   Description: Floating Point Register 64 bits
+   FloatArithmetic: True
++- Name: vreg
++  Size: 1024
++  Description: Vector Register 1024 bits (max possible specified by Vector spec)
+ - Name: SPR
+   Size: 64
+   Description: Special Purpose Register (64 bits)
++- Name: LMUL
++  Size: 64
++  Description: LMUL register
+diff --git a/targets/riscv/policies/seq.py b/targets/riscv/policies/seq.py
+index 3eb5307..849cb48 100644
+--- a/targets/riscv/policies/seq.py
++++ b/targets/riscv/policies/seq.py
+@@ -103,7 +103,7 @@ def policy(target, wrapper, **kwargs):
+ 
+     synthesizer.add_pass(
+         microprobe.passes.initialization.InitializeRegistersPass(
+-            value=RNDINT()
++            value=rand.randint(0, (2**1024)), lmul=lmul, sew=sew
+         )
+     )
+ 
+-- 
+2.34.1
+
