@@ -13,19 +13,11 @@ The assembly testcases are generated from
 
 Current upstream microprobe is missing support for the banana pi and some
 commonly used extensions. A pull request is currently in the works for the
-support [here](https://github.com/IBM/microprobe/pull/44). For now, we'll apply
-the patches manually.
+support [here](https://github.com/IBM/microprobe/pull/44).
 
-```
-git submodule update --init --recursive
-cd microprobe
-git am ../patches/*.patch
-```
-
-Once the patches have been applied, simply run `make init` and `make` to get
-started compiling. This will generate a directory `executables/` per target
-and a corresponding tarball. Copy the tarball and the `run_perf.sh` file over
-to the banana pi.
+Run `make init` and `make` to get started compiling. This will generate a
+directory `executables/` per target and a corresponding tarball. Copy the
+tarball and the `run_perf.sh` file over to the banana pi.
 
 ### Banana Pi
 

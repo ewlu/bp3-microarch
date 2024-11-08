@@ -18,7 +18,7 @@ init: stamps/init ## Initialize submodules and environments
 stamps/init:
 	git submodule update --init --recursive
 	mkdir -p stamps
-	cd microprobe && ./bootstrap_environment.sh
+	cd microprobe && ./bootstrap_environment.sh && git am ../patches/*.patch
 	touch stamps/init
 
 clean: ## Clean object files and executables
