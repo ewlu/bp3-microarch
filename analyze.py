@@ -56,6 +56,27 @@ def get_caption(fname: str):
     category = file.split("-")[:-2] if latency else file.split("-")[:-1]
     return f"{' '.join(category).title()} {'Latency' if latency else 'Throughput'} (IPC)"
 
+def create_index(save_path: str):
+    index_str = """
+<html>
+ <head>
+   <title>Banana Pi Microprobe Tables</title>
+ </head>
+ <body>
+   <h1>Tables</h1>
+   <div>
+     <ul>
+       <li><a href="./i-results.html">Integer Op Throughput</a></li>
+       <li><a href="./i-dep-results.html">Integer Op Latency</a></li>
+       <li><a href="./f-results.html">Floating Op Throughput</a></li>
+       <li><a href="./f-dep-results.html">Floating Op Latency</a></li>
+     </ul>
+   </div>
+ </body>
+ </html>
+    """
+    with open(f"{save_path}/index.html", "w") as f:
+        f.write(index_str)
 
 def save_table_as_html(df: pd.DataFrame, fname: str):
     styled_df = df.style.background_gradient(axis=None, cmap="Greens")
@@ -132,6 +153,7 @@ def main():
                 result = get_lower_triangular_combination_matrix(df, "IPC")
             fname, sep, tail = fname.partition(".csv")
             if args.save_html_path is not None:
+                create_index(args.save_html_path)
                 save_table_as_html(result, f"{fname.replace('./data', args.save_html_path)}.html")
             # get_stylized_markdown(result, f"{fname}-styled.md")
             result.to_markdown(f"{fname}.md")

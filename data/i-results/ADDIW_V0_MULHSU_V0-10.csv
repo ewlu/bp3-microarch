@@ -1,0 +1,16 @@
+counter value,counter unit,event name,run time,% measurement time,metric value,metric unit
+10003.44,msec,task-clock,10003436089,100.00,1.000,CPUs utilized
+9,,context-switches,10003391922,100.00,0.900,/sec
+0,,cpu-migrations,10003391297,100.00,0.000,/sec
+0,,page-faults,10003392964,100.00,0.000,/sec
+16005288876,,cycles,10003354465,100.00,1.600,GHz
+8004622132,,instructions,10003345048,100.00,0.50,insn per cycle
+,,,,1.00,stalled cycles per insn
+552655,,branches,10003344215,100.00,55.247,K/sec
+7297,,branch-misses,10003338590,100.00,1.32,of all branches
+4349178,,stalled-cycles-frontend,10003331798,100.00,0.03,frontend cycles idle
+7998711219,,stalled-cycles-backend,10003324589,100.00,49.98,backend cycles idle
+12013091272,,eu_stall,10003317005,100.00,1.201,G/sec
+4266069,,if_stall,10003303963,100.00,426.460,K/sec
+783035,,id_stall,10003290296,100.00,78.277,K/sec
+38250,,ib_stall,10003274046,100.00,3.824,K/sec
