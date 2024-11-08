@@ -22,9 +22,10 @@ cd microprobe
 git am ../patches/*.patch
 ```
 
-Once the patches have been applied, simply run `make` to get started compiling.
-This will generate a directory `executables/` per target and a corresponding
-tarball. Copy the tarball and the `run_perf.sh` file over to the banana pi.
+Once the patches have been applied, simply run `make init` and `make` to get
+started compiling. This will generate a directory `executables/` per target
+and a corresponding tarball. Copy the tarball and the `run_perf.sh` file over
+to the banana pi.
 
 ### Banana Pi
 
