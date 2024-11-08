@@ -43,7 +43,7 @@ jobs:
 
       - name: Install required packages
         run: |
-          pip install pandas matplotlib jinja2 tabulate
+          pip install -r ./requirements.txt
 
       - name: Generate site data
         run: |
