@@ -36,7 +36,7 @@ I2F ?= FMV.D.X_V0,FCVT.D.LU_V0,FCVT.D.L_V0,FCVT.D.W_V0,FCVT.D.WU_V0
 generated_asm/i-dep: ## Generate basic integer microbenchmarks with instruction dependencies. (Second insn depends on first's output)
 	mkdir -p generated_asm/i-dep
 	cd microprobe && . ./activate_microprobe && \
-	(python3 ./targets/generic/tools/mp_seq.py -p -s \
+	(python3 ./targets/generic/tools/mp_seq.py -p -s -e \
 		-T riscv_v22-riscv_generic-riscv64_bp3 \
 		-dd 1 \
 		-combinations \
@@ -48,7 +48,7 @@ generated_asm/i-dep: ## Generate basic integer microbenchmarks with instruction 
 generated_asm/f-dep: ## Generate basic float microbenchmarks with instruction dependencies. (Second insn depends on first's output)
 	mkdir -p generated_asm/f-dep
 	cd microprobe && . ./activate_microprobe && \
-	(python3 ./targets/generic/tools/mp_seq.py -p -s \
+	(python3 ./targets/generic/tools/mp_seq.py -p -s -e \
 		-T riscv_v22-riscv_generic-riscv64_bp3 \
 		-dd 1 \
 		-combinations \
@@ -59,7 +59,7 @@ generated_asm/f-dep: ## Generate basic float microbenchmarks with instruction de
 generated_asm/i: ## Generate basic integer microbenchmarks with no instruction dependencies.
 	mkdir -p generated_asm/i
 	cd microprobe && . ./activate_microprobe && \
-	(python3 ./targets/generic/tools/mp_seq.py -p -s \
+	(python3 ./targets/generic/tools/mp_seq.py -p -s -e \
 		-T riscv_v22-riscv_generic-riscv64_bp3 \
 		-dd 0 \
 		-combinations \
@@ -70,7 +70,7 @@ generated_asm/i: ## Generate basic integer microbenchmarks with no instruction d
 generated_asm/f: ## Generate basic float microbenchmarks with no instruction dependencies.
 	mkdir -p generated_asm/f
 	cd microprobe && . ./activate_microprobe && \
-	(python3 ./targets/generic/tools/mp_seq.py -p -s \
+	(python3 ./targets/generic/tools/mp_seq.py -p -s -e \
 		-T riscv_v22-riscv_generic-riscv64_bp3 \
 		-dd 0 \
 		-combinations \
@@ -81,7 +81,7 @@ generated_asm/f: ## Generate basic float microbenchmarks with no instruction dep
 generated_asm/i-i2f: ## Generate basic int, int/float conversion microbenchmarks with no instruction dependencies.
 	mkdir -p generated_asm/i-i2f
 	cd microprobe && . ./activate_microprobe && \
-	(python3 ./targets/generic/tools/mp_seq.py -p -s \
+	(python3 ./targets/generic/tools/mp_seq.py -p -s -e \
 		-T riscv_v22-riscv_generic-riscv64_bp3 \
 		-D ../generated_asm/i-i2f \
 		-combinations \
@@ -95,7 +95,7 @@ generated_asm/i-i2f: ## Generate basic int, int/float conversion microbenchmarks
 generated_asm/i-f2i: ## Generate basic int, int/float conversion microbenchmarks with no instruction dependencies.
 	mkdir -p generated_asm/i-f2i
 	cd microprobe && . ./activate_microprobe && \
-	(python3 ./targets/generic/tools/mp_seq.py -p -s \
+	(python3 ./targets/generic/tools/mp_seq.py -p -s -e \
 		-T riscv_v22-riscv_generic-riscv64_bp3 \
 		-D ../generated_asm/i-f2i \
 		-combinations \
@@ -109,7 +109,7 @@ generated_asm/i-f2i: ## Generate basic int, int/float conversion microbenchmarks
 generated_asm/f-i2f: ## Generate basic float, int/float conversion microbenchmarks with no instruction dependencies.
 	mkdir -p generated_asm/f-i2f
 	cd microprobe && . ./activate_microprobe && \
-	(python3 ./targets/generic/tools/mp_seq.py -p -s \
+	(python3 ./targets/generic/tools/mp_seq.py -p -s -e \
 		-T riscv_v22-riscv_generic-riscv64_bp3 \
 		-D ../generated_asm/f-i2f \
 		-combinations \
@@ -123,7 +123,7 @@ generated_asm/f-i2f: ## Generate basic float, int/float conversion microbenchmar
 generated_asm/f-f2i: ## Generate basic float, int/float conversion microbenchmarks with no instruction dependencies.
 	mkdir -p generated_asm/f-f2i
 	cd microprobe && . ./activate_microprobe && \
-	(python3 ./targets/generic/tools/mp_seq.py -p -s \
+	(python3 ./targets/generic/tools/mp_seq.py -p -s -e \
 		-T riscv_v22-riscv_generic-riscv64_bp3 \
 		-D ../generated_asm/f-f2i \
 		-combinations \
@@ -137,7 +137,7 @@ generated_asm/f-f2i: ## Generate basic float, int/float conversion microbenchmar
 generated_asm/ifconvert-dep: ## Generate basic int/float conversion microbenchmarks with instruction dependencies. (Each insn depends on previous' output)
 	mkdir -p generated_asm/ifconvert-dep
 	cd microprobe && . ./activate_microprobe && \
-	(python3 ./targets/generic/tools/mp_seq.py -p -s \
+	(python3 ./targets/generic/tools/mp_seq.py -p -s -e \
 		-T riscv_v22-riscv_generic-riscv64_bp3 \
 		-D ../generated_asm/ifconvert-dep \
 		-dd 1 \
@@ -153,7 +153,7 @@ generated_asm/ifconvert-dep: ## Generate basic int/float conversion microbenchma
 generated_asm/ifconvert-direct-dep: ## Generate direct int/float conversion microbenchmarks with instruction dependencies. (Each insn depends on previous' output)
 	mkdir -p generated_asm/ifconvert-direct-dep
 	cd microprobe && . ./activate_microprobe && \
-	(python3 ./targets/generic/tools/mp_seq.py -p -s \
+	(python3 ./targets/generic/tools/mp_seq.py -p -s -e \
 		-T riscv_v22-riscv_generic-riscv64_bp3 \
 		-D ../generated_asm/ifconvert-dep \
 		-dd 1 \
